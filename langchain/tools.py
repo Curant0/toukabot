@@ -1,17 +1,9 @@
 from langchain.tools import tool
-
+from typing import Dict, List
+    
 @tool("read_last_50_messages", return_direct=False)
 def read_last_50_messages(environment: str) -> List[Dict[str, str]]:
-    """
-    Reads the last 50 messages from a specified Discord environment.
-
-    Args:
-    environment (str): The name of the environment to read messages from.
-                       Must be either "Development Environment" or "Testing Environment".
-
-    Returns:
-    List[Dict[str, str]]: A list of dictionaries, each containing 'author' and 'content' of a message.
-    """
+    # TODO: Curanto: This enviroment stuff isn't necessary to be used by an agent, just create an ID check at the discord function.
     if environment not in ENVIRONMENTS:
         return [{
                     "error": f"Environment '{environment}' not found. Available environments are 'Development Environment' and 'Testing Environment'."}]
@@ -25,7 +17,12 @@ def read_last_50_messages(environment: str) -> List[Dict[str, str]]:
         return [{
                     "error": f"Channel for {environment} not found. It might have been deleted or the bot doesn't have access."}]
 
+    # NOTE: Useful stuff
     messages = []
+    # TODO: Obtain history data from outside of the tool. Or implement the decorator outside.
+    # Filter non-important users too (Other bots). Implement filter commands.
+    # After receiving that, the actual tool task would be getting actual english text.
+    # If possible make it so it interacts within a database giving a summary about some user.
     for message in reversed(channel.history(limit=50).flatten()):  # Use flatten() to make it synchronous
         messages.append({
             "author": str(message.author),

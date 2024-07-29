@@ -1,2 +1,0 @@
-- `character_prompts: dict` contains characters as "Name": "Prompt" refactored as json files
-- `supervisor_system_prompt` was a variable

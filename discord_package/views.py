@@ -31,3 +31,5 @@ class CharacterSelectView(discord.ui.View):
         # Store the user's selected character
         user_selected_characters[interaction.user.id] = selected_character
         await interaction.response.send_message(f"You have selected {selected_character}!", ephemeral=True)
+
+

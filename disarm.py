@@ -1,4 +1,5 @@
 import discord
+from discord import Option
 from discord.ext import commands
 from discord.ui import View, Select
 from discord.commands import SlashCommandGroup
@@ -7,17 +8,10 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.output_parsers.openai_functions import JsonOutputFunctionsParser
 from langchain_core.messages import BaseMessage, HumanMessage
+from langchain.tools import tool
 from langgraph.graph import StateGraph, END
 from typing import Annotated, List, Dict, Any, TypedDict, Sequence
-from pydantic import BaseModel
-from transformers import AutoModel
-import operator
-import requests
 import os
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
-import sqlite3
-import asyncio
 import threading
 import sys
 from queue import Queue
@@ -32,22 +26,22 @@ import asyncio
 import random
 import traceback
 import time
-#from langchain.vectorstores import Chroma
-#from docx import Document as DocxDocument
 from mem0 import Memory
-#from rag_tool import rag_processing
 import tracemalloc
 tracemalloc.start()
-#from ask_uncensored import ask_mistral_model
 
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 openai.api_key = OPENAI_API_KEY
+
 members = ["Web_Searcher", "Insight_Researcher", "Personality_Agent", "generic_worker", "memory_manager_agent"]
 #members=["Personality_Agent"]
+# Supervisor system prompt template
+supervisor_system_prompt = (
+    f"You are the supervisor. Based on the user's request, "
+    f"determine which agent should act next. Your options are: {', '.join(members)}. Send to the memory agent first each time. Send to the Personality_Agent ONCE and only ONCE."
+    "Respond with the name of the agent or 'FINISH' if no further action is required."
+)
 
-
-
-# TODO: Is this docker stuff?
 config = {
     "vector_store": {
         "provider": "qdrant",
@@ -57,7 +51,7 @@ config = {
         }
     },
 }
-# TODO: switch to pathlib
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 m = Memory.from_config(config)
@@ -67,17 +61,15 @@ memory_queue = Queue()
 
 MAX_LENGTH = 2000  # Discord's character limit for messages
 MAX_TOKENS = 100000 #CHATgpt 3.5 turbo approximation limit
-
-user_selected_characters = {}  # Maps user IDs to character names
-
 # Predefined environment names
 ENVIRONMENTS = {
-    "Development Environment": 'DEV_CHANNEL_ID',  # Will store channel ID
-    "Testing Environment": 'TEST_CHANNEL_ID',       # Will store channel ID
+    "Development Environment": '1110276173717573684',  # Will store channel ID
+    "Testing Environment": '1119061204493676554',
+    "Antik's Place": '1264252008462815343',# Will store channel ID
 }
-# TODO: CONSIDER NOW THEIR VALUES AS SYSTEM ENVIORMENT VALUES
-# TODO: REFACTOR/REPAIR
-# NOTE: MAYBE ALREADY IMPLEMENTED IN THE BOOLEAN IN utils
+
+environment_messages = {env: MessageHistory() for env in ENVIRONMENTS}
+
 
 def memory_worker():
     while True:
@@ -96,156 +88,17 @@ def memory_worker():
 worker_thread = threading.Thread(target=memory_worker, daemon=True)
 worker_thread.start()
 
-def ensure_messages_key(state):
-    if 'messages' not in state:
-        state['messages'] = []
-    return state
 
 
-# Define the Agent State, Edges and Graph
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    next: str
-    
-def count_tokens(text):
-    # This is a simplified approximation. For exact counts, use the tokenizer from the model's library.
-    return len(text.split())
-
-
-
-
-#for discord messages, and formatting
-def split_message(content, length=MAX_LENGTH):
-    """Splits the content into chunks that fit within Discord's message character limit."""
-    content = content.replace('\\n', '\n')  # Replace escaped newlines with actual newlines
-    return [content[i:i+length] for i in range(0, len(content), length)]
-
-
-# Agent setup
-def create_agent(llm: ChatOpenAI, tools: List, system_prompt: str):
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="messages"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-    agent = create_openai_tools_agent(llm, tools, prompt)
-    executor = AgentExecutor(agent=agent, tools=tools)
-    return executor
-
-
-# Initialize the language model
-llm = ChatOpenAI(model="gpt-4o-mini", frequency_penalty=0.6)
-
-system_prompt = (
-    "As a supervisor, your role is to oversee a dialogue between these"
-    f" workers: {members}. Based on the user's request,"
-    " determine which worker should take the next action. Each worker is responsible for"
-    " executing a specific task and reporting back their findings and progress. Include a task to always add a personality. Include a task to memorize new info and search existing. Once all tasks are complete,"
-    " indicate with 'FINISH'."
-)
-options = ["FINISH"] + members
-function_def = {
-    "name": "route",
-    "description": "Select the next role.",
-    "parameters": {
-        "title": "routeSchema",
-        "type": "object",
-        "properties": {
-            "next": {
-                "title": "Next",
-                "anyOf": [
-                    {"enum": options},
-                ],
-            }
-        },
-        "required": ["next"],
-    },
-}
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    MessagesPlaceholder(variable_name="messages"),
-    ("system", "Given the conversation above, who should act next? Or should we FINISH? Select one of: {options}"),
-]).partial(options=str(options), members=", ".join(members))
-
-def log_state(state):
-    print("Current state in supervisor chain:", state)
-    return state  # Pass the state through unchanged
-
-supervisor_chain = (prompt | llm.bind_functions(functions=[function_def], function_call="route") | JsonOutputFunctionsParser())
-
-# Define agents and nodes
-web_searcher_agent = create_agent(llm, tools, "You are a web searcher. Search the internet for information. Do not ask questions. Output less than 16000 Tokens.")
-insight_researcher_agent = create_agent(llm, tools, """
-You are an Insight Researcher. Identify topics, search the internet for each, and find insights. Include insights in your response. Do not ask questions. Output less than 16000 Tokens.
-""")
-# Create a generic worker agent with access to the enhanced tools list
-generic_worker_agent = create_agent(llm, tools, """
-You are a useful and helpful AI assistant. Respond to the prompt, and perform whatever task necessary, including deep content processing with RAG. Output less than 16000 Tokens.
-""")
-memory_manager_agent = create_agent(llm, tools, """
-You are a memory management agent. Search relevant information through memories in regards to a user and their request, as well as storing new information from user input.
-""")
-# Define agent nodes
-def agent_node(state, agent, name):
-    result = agent.invoke(state)
-    return {"messages": [HumanMessage(content=result["output"], name=name)]}
-
-'''
-# Define the Agent State, Edges, and Graph
-# Initialize the StateGraph with the defined schema
-workflow = StateGraph(schema=AgentStateSchema)
-workflow.add_node("Web_Searcher", lambda state: agent_node(state, web_searcher_agent, "Web_Searcher"))
-workflow.add_node("Insight_Researcher", lambda state: agent_node(state, insight_researcher_agent, "Insight_Researcher"))
-workflow.add_edge("Web_Searcher", "Insight_Researcher")
-workflow.set_entry_point("Web_Searcher")
-
-# Compile the graph 
-#compiled_graph = workflow.compile()
-'''
-
-# Connect to SQLite database (it will be created if it doesn't exist)
-conn = sqlite3.connect('token_usage.db')
-cursor = conn.cursor()
-
-# Create table for user balances
-cursor.execute('''CREATE TABLE IF NOT EXISTS user_balances
-               (user_id INTEGER PRIMARY KEY, balance REAL)''')
-
-# Create table for transactions (optional, for detailed tracking)
-cursor.execute('''CREATE TABLE IF NOT EXISTS transactions
-               (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, tokens_used INTEGER, cost REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-
-conn.commit()
-
-def add_new_user(user_id):
-    """Add a new user with an initial balance of $1.00 if they don't exist."""
-    if get_balance(user_id) is None:  # Check if the user already exists
-        cursor.execute("INSERT INTO user_balances (user_id, balance) VALUES (?, 1.00)", (user_id,))
-        conn.commit()
-
-
-def update_balance(user_id, cost):
-    """Update the user's balance after each interaction."""
-    cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id = ?", (cost, user_id))
-    conn.commit()
-
-
-def log_transaction(user_id, tokens_used, cost):
-    """Log a transaction in the database (optional)."""
-    cursor.execute("INSERT INTO transactions (user_id, tokens_used, cost) VALUES (?, ?, ?)", (user_id, tokens_used, cost))
-    conn.commit()
-
-def calculate_cost(tokens_used):
-    """Calculate the cost based on the number of tokens used."""
-    return (tokens_used / 1000000) * 0.6  # $0.60 per 1M output tokens  
-
-def get_balance(user_id):
-    """Retrieve the current balance for a user. Returns None if user does not exist."""
-    cursor.execute("SELECT balance FROM user_balances WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else None
-
+# TODO: For Curanto: Checkback and implement pathlib
+# Function to load .txt documents from a directory
+def load_text_documents(directory):
+    documents = []
+    for filepath in glob.glob(f"{directory}/*.txt"):
+        with open(filepath, 'r', encoding='utf-8') as file:
+            content = file.read()
+            documents.append(Document(page_content=content))
+    return documents
 
 
 # Discord bot setup
@@ -254,88 +107,27 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 #tree = app_commands.CommandTree(bot)
 
 
-@bot.event
-async def on_ready():
-    # Fetch global application commands
-    app_info = await bot.application_info()  # Get application info
-    global_commands = await bot.http.get_global_commands(app_info.id)
-    await load_extensions()    
-    print(f'{bot.user} is connected and ready to roll!')
-    # The new incantation to ensure the user_preferences table exists
-    with sqlite3.connect('token_usage.db') as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id INTEGER PRIMARY KEY,
-                ephemeral_preference BOOLEAN DEFAULT FALSE
-            );
-        """)
-        conn.commit()
-    # Load documents
-    #documents = load_text_documents('/home/tim/otherbot/lessonsinlovescript')  # Specify your directory path
-    #print(f'Loaded {len(documents)} documents.')
-
-    # Initialize Chroma with documents
-    #chroma_db = initialize_chroma_with_documents(documents)
-    #print(f'Loaded {len(documents)} documents into Chroma.')
-    #print('Documents are embedded and loaded into Chroma.')
-
-    # Store the Chroma instance globally or in a way that your bot can access during interactions
-    #bot.chroma_db = chroma_db  # Example of storing it as an attribute of the bot
-    # Loop through the commands and delete unwanted ones
-    #for command in global_commands:
-        #if command['name'] in ['ask', 'select-character']:  # Names of commands to remove
-           # await bot.http.delete_global_command(app_info.id, command['id'])
-#
-    print(f'{bot.user} is connected and old commands have been cleared.')
-
-async def process_command(interaction, query):
-    user_id = interaction.user.id
-    balance = get_balance(user_id)
-    if balance is None:
-        add_new_user(user_id)
-        balance = 1.0000 # Initial balance
-
-    # Your logic to process the command and generate a response
-    response, tokens_used = your_response_generation_function(query)
-    
-    cost = calculate_cost(tokens_used)
-    update_balance(user_id, cost)
-    log_transaction(user_id, tokens_used, cost)  # Optional
-    
-    new_balance = balance - cost
-    response += f"\nThis interaction costed ${cost:.4f}. Your new balance is ${new_balance:.2f}."
-    
-    await interaction.response.send_message(response, ephemeral=True)
-@bot.slash_command(description="Get the ID of an emoji")
-async def get_emoji_id(interaction: discord.Interaction, emoji: str):
+# NOTE: Curanto: I don't perceive benefit from this command.
+""" get_emoji_id
     # Try to find the emoji in the guild's emojis
-    for guild_emoji in interaction.guild.emojis:
-        if str(guild_emoji) == emoji:
-            await interaction.response.send_message(f'The ID of the emoji {emoji} is {guild_emoji.id}')
-            return
-    # If the emoji is not found, send an error message
-    await interaction.response.send_message('Emoji not found in this server.')
+"""
 
-def chunk_message(message, chunk_size=2000):
-    # Ensure message is a string
-    message = str(message)
-    # Return the message if it's within the chunk size limit
-    if len(message) <= chunk_size:
-        return [message]
-    # Otherwise, chunk the message
-    else:
-        return [message[i:i+chunk_size] for i in range(0, len(message), chunk_size)]
+# TODO: For curanto: Remake as util or exception. Ease readbility.
+"""chunk_message(message, chunk_size=2000):
+"""
+
+# TODO: Comeback later
 #@bot.slash_command(description="Ask an uncensored question")
 async def ask_uncensored(interaction: discord.Interaction, query: str):
     # Check if the channel is whitelisted
     if not is_channel_whitelisted(interaction):
+        # TODO: Separate Embed, or just filter it.
         # Create an embed for the error message
         embed = discord.Embed(title="Restricted Access", description="Oh no, this channel isn't fancy enough for my tastes. Try a whitelisted one, perhaps?", color=0xff0000)
-        # Send the embed as a response
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return  # Stop executing the command
 
+    # TODO: For Curanto: Fetch from the query, not the function.
     # Fetch user's preference for ephemeral messages
     ephemeral_preference = fetch_user_ephemeral_preference(interaction.user.id)
 
@@ -347,7 +139,7 @@ async def ask_uncensored(interaction: discord.Interaction, query: str):
 
     # Use the chunking utility to split the response text if it's too long
     response_chunks = chunk_message(response_text)
-
+    
     # Send each chunk as a separate message
     for chunk in response_chunks:
         embed = discord.Embed(description=chunk, color=0x00ff00)  # Create embed for each chunk
@@ -464,8 +256,20 @@ def fetch_user_ephemeral_preference(user_id: int) -> bool:
 @bot.event
 async def on_message(message):
     # Ignore messages from the bot itself
-    if message.author == bot.user:
-        return
+    #if message.author == bot.user:
+    #    return
+    
+    # CHANGE: Store the message using channel ID as the key
+    channel_id = str(message.channel.id)
+    if channel_id not in environment_messages:
+        environment_messages[channel_id] = MessageHistory()
+    
+    environment_messages[channel_id].add_message(
+        str(message.author),
+        message.author.name,
+        message.content,
+      #  message.created_at.isoformat()
+    )
 
     # Check if the message is a reply to the bot
     if message.reference and message.reference.resolved.author == bot.user:
@@ -481,7 +285,7 @@ async def on_message(message):
         combined_query = f"Previous query: {original_query}\nPrevious response: {original_response}\nNew query: {message.content}"
 
         # Call handle_reply to process the reply
-        await handle_reply(message.channel, message.author, combined_query, message.content)
+        await handle_reply(message)
     elif bot.user in message.mentions:
         # Remove the bot's mention from the message content
         query = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
@@ -492,7 +296,7 @@ async def on_message(message):
             combined_query = f"New query: {query}"
 
             # Call handle_reply to process the mention
-            await handle_reply(message.channel, message.author, combined_query, query)
+            await handle_reply(message)
 
     # Process commands
     await bot.process_commands(message)
@@ -536,7 +340,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name="Selecting a Character", value="Use `/select_character <character_name>` to choose an AI persona for your interactions. Each character has a unique personality and will respond differently.", inline=False)
     embed.add_field(name="What are Tokens?", value="Tokens are currency for interaction. Each message processed by the bot costs tokens. You can check your token balance with `/balance`. Buy more tokens using `/buy-more-tokens` to support AI development and continue using the bot.", inline=False)
     embed.add_field(name="Interacting with the Bot", value="Use `/interact <your_message>` to engage with the bot in a conversation. The bot will respond based on the selected character's personality and your query.", inline=False)
-    embed.add_field(name="Uncensored Model", value="The uncensored model, accessible with `/ask_uncensored`, provides responses without content restrictions. It is designed for open-ended questions and may provide more direct answers.", inline=False)
+    #embed.add_field(name="Uncensored Model", value="The uncensored model, accessible with `/ask_uncensored`, provides responses without content restrictions. It is designed for open-ended questions and may provide more direct answers.", inline=False)
     embed.set_footer(text="For more information or assistance, contact the bot developer, Womp Womp.")
     
     ephemeral_preference = fetch_user_ephemeral_preference(interaction.user.id)
@@ -571,8 +375,8 @@ async def balance(interaction: discord.Interaction):
 async def character_autocomplete(ctx: discord.AutocompleteContext):
     return [character for character in character_prompts if ctx.value.lower() in character.lower()]
 
-#@bot.slash_command(name="select_character", description="Select a character")
-#@discord.option("character", description="Choose your character", autocomplete=character_autocomplete)
+@bot.slash_command(name="select_character", description="Select a character")
+@discord.option("character", description="Choose your character", autocomplete=character_autocomplete)
 async def select_character(ctx: discord.ApplicationContext, character: str):
     # Check if the channel is whitelisted
     if not is_channel_whitelisted(ctx):
@@ -653,7 +457,7 @@ async def interact(interaction: discord.Interaction, query: str, is_reply: bool 
         return
     
 
-    # Fetch the selected character for the user or default to "DefaultCharacter"
+    # Fetch the selected character for the user or default Touka: "DefaultCharacter"
     character_name = user_selected_characters.get(user_id, "Touka")
 
     # Fetch the system prompt for the selected character or default prompt
@@ -778,6 +582,7 @@ async def interact(interaction: discord.Interaction, query: str, is_reply: bool 
 """
 @bot.slash_command(description="Interact with the AI agent")
 async def interact(interaction: discord.Interaction, query: str):
+    # Acknowledge the interaction immediately and defer the actual response):
     # Acknowledge the interaction immediately and defer the actual response
     if not is_channel_whitelisted(interaction):
         await interaction.response.send_message("Oh no, this channel isn't fancy enough for my tastes. Try a whitelisted one, perhaps?", ephemeral=True)
@@ -804,35 +609,49 @@ async def interact(interaction: discord.Interaction, query: str):
         return
 
     # Fetch the last 10 messages from the channel
-    channel = interaction.channel
-    last_messages = []
-    async for message in channel.history(limit=10):
-        message_data = {
-            "author": str(message.author),
-            "username": message.author.name,
-            "content": message.content,
-            "timestamp": message.created_at.isoformat()
-        }
-        last_messages.append(message_data)
-    last_messages.reverse()  # Most recent last
-    
+    #channel = interaction.channel
+    #last_messages = []
+    #async for message in channel.history(limit=10):
+    #    message_data = {
+    #        "author": str(message.author),
+    #        "username": message.author.name,
+    #        "content": message.content,
+    #        "timestamp": message.created_at.isoformat()
+    #    }
+    #    last_messages.append(message_data)
+    #last_messages.reverse()  # Most recent last
+        # CHANGE: Get stored messages for the current channel
+
+    # CHANGE: Get stored messages for the current channel
+    channel_id = str(interaction.channel.id)
+    print(channel_id)
+    if channel_id not in environment_messages:
+        environment_messages[channel_id] = MessageHistory()
     # Add the current query to the messages
-    last_messages.append({
-        "author": str(interaction.user),
-        "username": interaction.user.name,
-        "content": query
-        #"timestamp": interaction.created_at.isoformat()
-    })
+    environment_messages[channel_id].add_message(
+        str(interaction.user),
+        interaction.user.name,
+        query,
+       # interaction.created_at.isoformat()
+    )
 
-    # Fetch the selected character for the user or default to "Touka"
+    # Get the last 10 messages in a formatted string
+    stored_messages = environment_messages[channel_id].read(10)
+    print("-----------------------------------------------------------")
+    print(stored_messages)
+    print(f"New query: {query}")
+
+    # Fetch the selected character for the user or default Touka: "Touka"
     character_name = user_selected_characters.get(user_id, "Touka")
-
+    # Use the selected character or default to "Touka"
+    #character_name = character or "Touka"
+    
     # Fetch the system prompt for the selected character or default prompt
-    system_prompt = character_prompts.get(character_name, "You are KirinBot, a helpful AI Assistant. Take input text and output it with added flair, sass, zest, and sexiness! And any additional analysis, of course.")
+    system_prompt = character_prompts.get(character_name, "You are Toukabot, a helpful AI Assistant. Take input text and output it with added flair, sass, zest, and sexiness! And any additional analysis, of course.")
 
     try:
         # Call the AI conversation function
-        response = ai_conversation(last_messages, character_name, system_prompt, tools)
+        response = ai_conversation(stored_messages, character_name, system_prompt, tools, interaction.channel.id)
         
         # Count tokens in the response
         total_tokens_used += count_tokens(response)
@@ -843,7 +662,7 @@ async def interact(interaction: discord.Interaction, query: str):
         new_balance = balance - interaction_cost
         
         # Create a plain text response
-        response_text = f"{character_name} says:\n{response}\n\n"
+        response_text = f"{response}\n\n"
         response_text += f"Tokens: {total_tokens_used}; Used: ${interaction_cost:.4f}; Owned: ${new_balance:.4f}"
         
         # Send the plain text response
@@ -856,18 +675,6 @@ async def interact(interaction: discord.Interaction, query: str):
 # Make sure to add the following tools to your tools list:
 # tools.extend([set_sleep, get_sleep])
 #bot.add_view(ReplyView(bot, interact))
-@bot.event
-async def on_message(message):
-    # Ignore messages from the bot itself
-    if message.author == bot.user:
-        return
-
-    # Check if the message is a reply to the bot
-    if message.reference and message.reference.resolved.author == bot.user:
-        await handle_reply(message)
-
-    # Process commands
-    await bot.process_commands(message)
 
 async def handle_reply(message):
     # Get the original message (bot's message)
@@ -875,7 +682,7 @@ async def handle_reply(message):
     
     # Extract the original query and response
     original_content = original_message.content.split('\n', 1)
-    character_name = original_content[0].split(' says:')[0] if len(original_content) > 0 else "Unknown"
+    #character_name = original_content[0].split(' says:')[0] if len(original_content) > 0 else "Unknown"
     original_response = original_content[1] if len(original_content) > 1 else ""
 
     # Create the combined query
@@ -898,31 +705,32 @@ async def handle_reply(message):
         return
 
     # Fetch the selected character for the user or default to the one used in the original message
-    character_name = user_selected_characters.get(user_id, character_name)
+    character_name = user_selected_characters.get(user_id)
 
     # Fetch the system prompt for the selected character or default prompt
     system_prompt = character_prompts.get(character_name, "You are KirinBot, a helpful AI Assistant. Take input text and output it with added flair, sass, zest, and sexiness! And any additional analysis, of course.")
 
     try:
-        # Fetch the last few messages for context
-        context_messages = []
-        async for msg in message.channel.history(limit=5, before=message):
-            context_messages.append({
-                "author": str(msg.author),
-                "username": msg.author.name,
-                "content": msg.content,
-                "timestamp": msg.created_at.isoformat()
-            })
-        context_messages.reverse()
-        context_messages.append({
-            "author": str(message.author),
-            "username": message.author.name,
-            "content": message.content,
-            "timestamp": message.created_at.isoformat()
-        })
+        # CHANGE: Get stored messages for the current channel
+        channel_id = str(message.channel.id)
+        if channel_id not in environment_messages:
+            environment_messages[channel_id] = MessageHistory()
+        # Add the current query to the messages
+        #environment_messages[channel_id].add_message(
+        #    str(message.author),
+        #    message.author.name,
+        #    message.content,
+        ## interaction.created_at.isoformat()
+        #)
+    
+        # Get the last 10 messages in a formatted string
+        stored_messages = environment_messages[channel_id].read(10)
+        print("--------------------------stored_messages---------------------------------")
+        print(stored_messages)
+        print(f"New query: {stored_messages}")
 
         # Call the AI conversation function
-        response = ai_conversation(context_messages, character_name, system_prompt, tools)
+        response = ai_conversation(stored_messages, character_name, system_prompt, tools, message.channel.id)
         
         # Count tokens in the response
         total_tokens_used += count_tokens(response)
@@ -933,16 +741,12 @@ async def handle_reply(message):
         new_balance = balance - interaction_cost
         
         # Create a plain text response
-        response_text = f"{character_name} says:\n{response}\n\n"
+        response_text = f"{response}\n\n"
         response_text += f"Tokens: {total_tokens_used}; Spent: ${interaction_cost:.4f}; Owned: ${new_balance:.4f}"
         
         # Send the response as a reply to the user's message
         await message.reply(response_text)
         
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        error_message = f"An error occurred while processing your request: {str(e)}"
-        await message.reply(error_message)
     except Exception as e:
         print(f"An error occurred: {e}")
         # Create an embed for the error message
@@ -953,8 +757,9 @@ async def verify_ai_cog(self, ctx):
     await ctx.send("AutonomousAIConversation cog is active!")
     logger.info("Verify command was called")
     
-def ai_conversation(last_messages: List[Dict[str, str]], character_name: str, system_prompt: str, tools: List):
+def ai_conversation(last_messages: List[Dict[str, str]], character_name: str, system_prompt: str, tools: List, channel_id: str):
     # Initialize the dynamic StateGraph for this interaction
+    print(channel_id)
     dynamic_workflow = StateGraph(AgentState)
     print("    dynamic_workflow = StateGraph(AgentState)")
     # Create the dynamic agent based on the selected character's prompt
@@ -986,33 +791,41 @@ def ai_conversation(last_messages: List[Dict[str, str]], character_name: str, sy
     
     # Compile the graph
     compiled_dynamic_graph = dynamic_workflow.compile()
+   
+   #combined_messages = stored_messages[-10:]  # Get last 10 stored messages
+    #async for message in interaction.channel.history(limit=10):
+    #    message_data = {
+    #        "author": str(message.author),
+    #        "username": message.author.name,
+    #        "content": message.content,
+    #        "timestamp": message.created_at.isoformat()
+    #    }
+    #    if message_data not in combined_messages:
+    #        combined_messages.append(message_data)
+    #
+
+    print("------------------------------------------------------")
+    print(last_messages)
     
-    # Prepare the input data
-    last_10_messages = last_messages[-10:]  # Get the last 10 messages
-    message_history = "\n".join([f"{msg['author']}: {msg['content']}" for msg in last_10_messages])
-    
-    query = f"""(This query here is the one you should respond to directly)
-    
-    
-    Message History:
-    {message_history}
-    
-    Based on the message history and the current sleep timer, please respond as {character_name}.
-    Remember that most users like a chilled, laid back experience. But if they want a response warranting the full might of your underlying model, then use it to your fullest potential.
-    Remember to stay in character and follow the system prompt guidelines.
+    query = f"""{last_messages}
+    ||System Message: This message here is the one you should directly reply to||
     """
     
     input_data = {"messages": [HumanMessage(content=query)]}
+    print("-------------------------input data-----------------------------")
+    print(input_data)
     
     # Process the query through the graph
     last_output = None
     for output in compiled_dynamic_graph.stream(input_data, stream_mode="updates"):
         last_output = output
+        print("--------------------------last output----------------------------")
         print(last_output)
         if output.get("agent", {}).get("state") != "terminal":
             for key, value in output.items():
                 if key != "supervisor":
                     latest_message_content = value["messages"][-1].content
+                    print("-----------------------latest_message_contet-------------------------------")
                     print(latest_message_content)
                     if latest_message_content != query:
                         input_data["messages"].append(value["messages"][-1])
@@ -1024,6 +837,18 @@ def ai_conversation(last_messages: List[Dict[str, str]], character_name: str, sy
             if isinstance(value, dict) and "messages" in value:
                 final_message = value["messages"][-1]
                 print(final_message)
+                channel_id = str(channel_id)
+                if channel_id not in environment_messages:
+                    environment_messages[channel_id] = MessageHistory()
+
+                        # Add the current query to the messages
+                environment_messages[channel_id].add_message(
+                    character_name,
+                    character_name,
+                    final_message,
+                 #interaction.created_at.isoformat()
+                )
+    
                 break
     
     return final_message.content if final_message else "No response generated."
@@ -1078,6 +903,7 @@ class AutonomousAIConversation(commands.Cog):
     async def ai_decision_process(self):
         try:
             # Choose a random environment
+            # NOTE: Curanto: Why random?
             environment = random.choice(["Development Environment", "Testing Environment"])
             logger.info(f"Selected environment: {environment}")
             
