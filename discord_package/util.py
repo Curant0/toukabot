@@ -1,20 +1,16 @@
-from discord import ApplicationContext
+from discord.ext import commands
 from os import getenv
-WHITELISTED_CHANNELS = getenv('DEV_CHANNEL_ID'), getenv('TEST_CHANNEL_ID')
+# TODO: Try to make a easier launch
+WHITELISTED_CHANNELS = [getenv('DEV_CHANNEL_ID'), getenv('TEST_CHANNEL_ID')]
 
-def is_channel_whitelisted(ctx: ApplicationContext) -> bool:
-    if str(ctx.channel_id) not in WHITELISTED_CHANNELS:
-        return False
-    return True
-
-def ensure_messages_key(state):
-    if 'messages' not in state:
-        state['messages'] = []
-    return state
+# Changed function to a decorator
+def is_channel_whitelisted():
+    async def predicate(ctx):
+        return ctx.channel.id in WHITELISTED_CHANNELS
+    return commands.check(predicate)
 
 
-
-
+# TODO: Make an embed out of this
 support_message = (
     "Looking to power up? Your support accelerates our journey into the future of AI. "
     "Top up your token balance and keep the code compiling by buying me a coffee! "
@@ -24,8 +20,7 @@ support_message = (
 )
 
 
-
-# INFO: Database balance interaction
+# TODO: Database balance interaction, move to the ORM.
 async def process_command(interaction, query):
     user_id = interaction.user.id
     balance = get_balance(user_id)
