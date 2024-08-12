@@ -342,6 +342,7 @@ async def interact(interaction: discord.Interaction, query: str):
         await interaction.response.send_message("Oh no, this channel isn't fancy enough for my tastes. Try a whitelisted one, perhaps?", ephemeral=True)
         return  # Stop executing the command
     
+
     ephemeral_preference = fetch_user_ephemeral_preference(interaction.user.id)
     await interaction.response.defer(ephemeral=ephemeral_preference)
     print(f"Received query from {interaction.user}: {query}")
@@ -361,20 +362,6 @@ async def interact(interaction: discord.Interaction, query: str):
     if balance <= 0:
         await interaction.response.send_message("You do not have enough balance to use this command.", ephemeral=True)
         return
-
-    # Fetch the last 10 messages from the channel
-    #channel = interaction.channel
-    #last_messages = []
-    #async for message in channel.history(limit=10):
-    #    message_data = {
-    #        "author": str(message.author),
-    #        "username": message.author.name,
-    #        "content": message.content,
-    #        "timestamp": message.created_at.isoformat()
-    #    }
-    #    last_messages.append(message_data)
-    #last_messages.reverse()  # Most recent last
-        # CHANGE: Get stored messages for the current channel
 
     # CHANGE: Get stored messages for the current channel
     channel_id = str(interaction.channel.id)
